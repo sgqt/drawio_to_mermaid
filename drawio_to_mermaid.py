@@ -82,6 +82,7 @@ class DrawioToMermaid:
         self.strict = strict
         self.logger = self._setup_logger(log_level)
         self.diagram_pages: List[str] = []
+        self._processed_edges: set = set()  # For deduplication
 
     def _setup_logger(self, level: int) -> logging.Logger:
         """Setup logger with the specified level."""
@@ -414,114 +415,223 @@ class DrawioToMermaid:
         edges = []
         node_map = {}
         groups = {}
+        
+        # Reset edge deduplication tracking
+        self._processed_edges = set()
 
         # Find the root element containing cells
         diagram_root = root.find("root")
         if diagram_root is None:
             diagram_root = root
 
-        # Process UserObject elements that wrap mxCell
-        # Build mapping from UserObject to its nested mxCell
+        # Build mapping: cell ID -> UserObject ID (for cells that are children of UserObject)
+        cell_to_userobject: Dict[str, str] = {}
+        userobject_labels: Dict[str, str] = {}
+        userobject_nested_ids: set = set()  # IDs of mxCells nested inside UserObjects
+        userobject_has_nested_cell: Dict[str, bool] = {}  # UserObject id -> has nested mxCell
+        mxcell_to_parent: Dict[int, ET.Element] = {}  # mxCell element id -> parent element
+        
+        # Build parent map for all elements
+        for elem in diagram_root.iter():
+            for child in elem:
+                mxcell_to_parent[id(child)] = elem
+        
         for user_obj in diagram_root.iter("UserObject"):
-            user_id = user_obj.get("id")
-            user_label = user_obj.get("label") or ""
-            user_label = self._strip_html_labels(user_label)
-            
-            # Find nested mxCell within this UserObject
-            for cell in user_obj.findall("mxCell"):
-                cell_id = cell.get("id")
+            obj_id = user_obj.get("id")
+            if not obj_id:
+                continue
                 
-                if cell.get("vertex") == "1":
-                    # If mxCell has no id, use UserObject's id
-                    if not cell_id:
-                        cell_id = user_id
-                    
-                    if cell_id in ("0", "1"):
-                        continue
-                    
-                    # Get label from mxCell value, or from UserObject
-                    label = cell.get("value") or ""
-                    if not label:
-                        label = user_label
-                    label = self._strip_html_labels(label)
-                    
-                    style = cell.get("style") or ""
-                    geometry = cell.find("mxGeometry")
+            obj_label = user_obj.get("label") or ""
+            userobject_labels[obj_id] = self._strip_html_labels(obj_label)
+            
+            nested_cells = user_obj.findall("mxCell")
+            userobject_has_nested_cell[obj_id] = len(nested_cells) > 0
+            
+            # Mark all nested mxCells as belonging to this UserObject
+            for cell in nested_cells:
+                nested_cell_id = cell.get("id")
+                if nested_cell_id:
+                    cell_to_userobject[nested_cell_id] = obj_id
+                    userobject_nested_ids.add(nested_cell_id)
+                else:
+                    # Nested mxCell without id - use UserObject's id
+                    cell_to_userobject[f"_uo_{obj_id}"] = obj_id
+                    userobject_nested_ids.add(f"_uo_{obj_id}")
 
-                    node = {
-                        "id": cell_id,
-                        "label": label,
-                        "style": style,
-                        "style_dict": self._parse_style(style),
-                        "geometry": geometry.attrib if geometry is not None else {},
-                        "parent": cell.get("parent")
-                    }
-                    if cell_id not in node_map:  # Don't duplicate if already processed
-                        nodes.append(node)
-                        node_map[cell_id] = node
+        # Build set of mxCell IDs that are shape containers (have other cells as children)
+        container_ids = set()
+        for cell in diagram_root.iter("mxCell"):
+            cell_id = cell.get("id")
+            if cell_id and cell.get("vertex") == "1":
+                for other in diagram_root.iter("mxCell"):
+                    if other.get("parent") == cell_id:
+                        container_ids.add(cell_id)
+                        break
 
-                elif cell.get("edge") == "1":
-                    # If mxCell has no id, use UserObject's id
-                    if not cell_id:
-                        cell_id = user_id
-                    
-                    # Get label from mxCell value, or from UserObject
-                    label = cell.get("value") or ""
-                    if not label:
-                        label = user_label
-                    label = self._strip_html_labels(label)
-                    
-                    edge = {
-                        "id": cell_id,
-                        "source": cell.get("source"),
-                        "target": cell.get("target"),
-                        "label": label,
-                        "style": cell.get("style") or "",
-                        "style_dict": self._parse_style(cell.get("style") or "")
-                    }
-                    edges.append(edge)
-
-        # Process standalone mxCell elements (not inside UserObject)
+        # Process all mxCells
         for cell in diagram_root.iter("mxCell"):
             cell_id = cell.get("id")
             if cell_id in ("0", "1"):
                 continue
-            
-            # Skip if already processed as part of UserObject
-            if cell_id in node_map:
-                continue
 
-            if cell.get("vertex") == "1":
-                label = cell.get("value") or ""
-                label = self._strip_html_labels(label)
+            parent_id = cell.get("parent")
+            is_vertex = cell.get("vertex") == "1"
+            is_edge = cell.get("edge") == "1"
+            value = cell.get("value") or ""
+
+            if is_vertex:
+                # Determine effective ID and label
+                effective_id = cell_id
+                label = self._strip_html_labels(value)
+                
+                # Check if this cell belongs to a UserObject (nested inside it)
+                userobj_id = cell_to_userobject.get(cell_id) if cell_id else None
+                
+                # Check if this is a nested mxCell (no id) inside a UserObject
+                # by looking at the parent XML element via our map
+                if not cell_id:
+                    parent_element = mxcell_to_parent.get(id(cell))
+                    if parent_element is not None and parent_element.tag == "UserObject":
+                        uo_id = parent_element.get("id")
+                        if uo_id:
+                            uo_label = userobject_labels.get(uo_id, "")
+                            if uo_label:
+                                # Use UserObject's id and label
+                                effective_id = uo_id
+                                label = uo_label
+                
+                # Check if parent is a UserObject (this cell is inside a UserObject container)
+                if parent_id and parent_id in userobject_labels:
+                    # This cell is INSIDE a UserObject container
+                    parent_label = userobject_labels.get(parent_id, "")
+                    
+                    # If parent UserObject has empty label but this cell has a value,
+                    # use this cell's value and the parent's ID
+                    if not parent_label and label:
+                        effective_id = parent_id
+                        # Keep label from this cell
+                    elif parent_label:
+                        # Parent has a label, use it
+                        effective_id = parent_id
+                        label = parent_label
+                
+                # If cell has no value, get label from UserObject
+                if not label and userobj_id:
+                    label = userobject_labels.get(userobj_id, "")
+                    if not cell_id:
+                        effective_id = userobj_id
+                
+                # If still no label but we have an effective_id, use a default label
+                if not label and effective_id:
+                    label = f"Node_{effective_id}"
+                
+                # Skip if still no label
+                if not label:
+                    continue
+                
+                # Skip if this cell is a TEXT LABEL inside another cell container
+                # Text labels have style containing "text" and their label is not the same as the parent's
+                cell_style = cell.get("style") or ""
+                if parent_id and parent_id in container_ids and "text" in cell_style:
+                    # Check if parent cell has its own value
+                    parent_has_value = False
+                    for pcell in diagram_root.iter("mxCell"):
+                        if pcell.get("id") == parent_id and pcell.get("value"):
+                            parent_has_value = True
+                            break
+                    if parent_has_value:
+                        continue
+                
+                # Skip if already processed
+                if effective_id and effective_id in node_map:
+                    continue
+                
+                # Skip if no effective_id
+                if not effective_id:
+                    continue
                 
                 style = cell.get("style") or ""
                 geometry = cell.find("mxGeometry")
 
                 node = {
-                    "id": cell_id,
+                    "id": effective_id,
                     "label": label,
                     "style": style,
                     "style_dict": self._parse_style(style),
                     "geometry": geometry.attrib if geometry is not None else {},
-                    "parent": cell.get("parent")
+                    "parent": parent_id
                 }
                 nodes.append(node)
-                node_map[cell_id] = node
+                node_map[effective_id] = node
 
-            elif cell.get("edge") == "1":
-                label = cell.get("value") or ""
-                label = self._strip_html_labels(label)
+            elif is_edge:
+                # Determine effective edge ID and label
+                effective_edge_id = cell_id
+                label = self._strip_html_labels(value)
+                source = cell.get("source")
+                target = cell.get("target")
+                
+                # Check if this is a nested edge (no id) inside a UserObject
+                if not cell_id:
+                    parent_element = mxcell_to_parent.get(id(cell))
+                    if parent_element is not None and parent_element.tag == "UserObject":
+                        uo_id = parent_element.get("id")
+                        if uo_id:
+                            # Get label from UserObject if edge has no label
+                            if not label:
+                                label = userobject_labels.get(uo_id, "")
+                            effective_edge_id = uo_id
+                
+                # Skip edges with no effective id
+                if not effective_edge_id:
+                    continue
+                
+                # Try to get label from parent UserObject (for non-nested edges)
+                if not label:
+                    userobj_id = cell_to_userobject.get(cell_id) if cell_id else None
+                    if userobj_id:
+                        label = userobject_labels.get(userobj_id, "")
+                
+                # Skip edges with no source or target
+                if not source or not target:
+                    continue
                 
                 edge = {
-                    "id": cell_id,
-                    "source": cell.get("source"),
-                    "target": cell.get("target"),
+                    "id": effective_edge_id,
+                    "source": source,
+                    "target": target,
                     "label": label,
                     "style": cell.get("style") or "",
                     "style_dict": self._parse_style(cell.get("style") or "")
                 }
-                edges.append(edge)
+                
+                # Deduplicate edges
+                # - If has cell_id: use cell_id as key (each edge element is unique)
+                # - If no cell_id but has label: use (source, target, label) as key
+                # - If no cell_id and no label: use (source, target) as key (same connection = duplicate)
+                should_add = True
+                
+                if cell_id:
+                    # Has its own ID - use it as key
+                    edge_key = f"id:{cell_id}"
+                    if edge_key in self._processed_edges:
+                        should_add = False
+                    self._processed_edges.add(edge_key)
+                elif label:
+                    # No cell_id but has label - use (source, target, label) as key
+                    edge_key = f"label:{source}:{target}:{label}"
+                    if edge_key in self._processed_edges:
+                        should_add = False
+                    self._processed_edges.add(edge_key)
+                else:
+                    # No cell_id and no label - use (source, target) as key
+                    edge_key = f"edge:{source}:{target}"
+                    if edge_key in self._processed_edges:
+                        should_add = False
+                    self._processed_edges.add(edge_key)
+                
+                if should_add:
+                    edges.append(edge)
 
         # Build groups
         for node in nodes:
